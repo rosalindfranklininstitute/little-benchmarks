@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Duncan McDougall <duncan.mcdougall@rfi.ac.uk>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 [project]
 name = "little-benchmarks"
 version = "0.1.0"
@@ -6,6 +10,7 @@ readme = "README.md"
 authors = [
     { name = "McDougall", email = "Duncan.McDougall@rfi.ac.uk" }
 ]
+license='Apache-2.0'
 requires-python = ">=3.13"
 dependencies = [
     "h5py>=3.16.0",
