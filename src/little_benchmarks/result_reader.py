@@ -21,11 +21,11 @@ from ms_nexus_tools.lib.utils import parse_bytes, format_bytes
 
 @dataclass
 class FileResult:
-    filename: str
     compression: str
     filetype: str
     time: float
     size: int
+    data_size: int
     chunk_shape: Shape
     chunk_size: int
     memory_count: float
@@ -118,19 +118,40 @@ def accept_all(row: dict[str, Any]) -> bool:
 
 
 def accept_compressed(row: dict[str, Any]) -> bool:
-    return "None" not in row["compression"]
+    return "none" not in row["compression"]
 
 
 def accept_blosc(row: dict[str, Any]) -> bool:
-    return row["compression"] == "blosc"
+    return "blosc" in row["compression"]
 
 
 def accept_zarr(row: dict[str, Any]) -> bool:
-    return row["filetype"] == "zarr"
+    return "zarr" in row["filetype"]
+
+
+def accept_deflate_zarr(row: dict[str, Any]) -> bool:
+    return "deflate_zarr" == row["filetype"]
+
+
+def accept_store_zarr(row: dict[str, Any]) -> bool:
+    return "store_zarr" == row["filetype"]
+
+
+def accept_hdf(row: dict[str, Any]) -> bool:
+    return "hdf" == row["filetype"]
+
+
+def accept_int_mc(row: dict[str, Any]) -> bool:
+    mc = row["memory_count"]
+    return int(mc) == mc
 
 
 def reject_gzip(row: dict[str, Any]) -> bool:
     return "gzip" not in row["compression"]
+
+
+def accept_gzip(row: dict[str, Any]) -> bool:
+    return "gzip" in row["compression"]
 
 
 def reject_gzip9(row: dict[str, Any]) -> bool:
@@ -165,11 +186,77 @@ def plot_x_sizes(ax: plt.Axes, plot_data: PlotData):
         i += 1
 
 
+FilterFunc = Callable[[dict[str, Any]], bool]
+
+
 @dataclass
 class DataFilter:
     x_min: None | float | int = None
     x_max: None | float | int = None
-    run: Callable[[dict[str, Any]], bool] = accept_all
+    run: FilterFunc = accept_all
+
+
+def get_colors_for_columns(data, cols: list[pl.Expr], sort: bool):
+    counts = [len(data.select(c).unique()) for c in cols]
+    values = [[v[0] for v in data.select(c).unique().sort(by=c).rows()] for c in cols]
+    if sort:
+        inx_col = np.argsort(counts)[::-1]
+    else:
+        inx_col = np.arange(len(values))
+
+    sorted_values = [values[ii] for ii in inx_col]
+    sorted_counts = [counts[ii] for ii in inx_col]
+
+    inv_col = np.zeros_like(inx_col)
+    inv_col[inx_col] = np.arange(len(inx_col))
+
+    colors = itertools.cycle(mcolors.TABLEAU_COLORS)
+    linestyles = itertools.cycle(["-", "--", "-.", ":"])
+    markers = itertools.cycle("o^sp*dP")
+
+    if np.any([c == 0 for c in counts]):
+        print("WARNING: not values provided.")
+        return {}
+
+    color_choices = [next(colors) for _ in sorted_values[0]]
+    if len(values) > 1:
+        linestyle_choices = [next(linestyles) for _ in sorted_values[1]]
+        if len(values) > 2:
+            marker_choices = [next(markers) for _ in sorted_values[2]]
+        else:
+            marker_choices = ["o"]
+    else:
+        marker_choices = ["o"]
+        linestyle_choices = ["-"]
+
+    current_color = color_choices[0]
+    current_marker = marker_choices[0]
+    current_linestyle = linestyle_choices[0]
+
+    styles = {}
+
+    for ii, value in enumerate(itertools.product(*sorted_values)):
+        for jj in range(1, min(len(values) + 1, 4)):
+            rate_of_change = int(np.prod(sorted_counts[jj:]))
+            inx = (ii // rate_of_change) % sorted_counts[jj - 1]
+            match (jj - 1) % 3:
+                case 0:
+                    current_color = color_choices[inx]
+                case 1:
+                    current_linestyle = linestyle_choices[inx]
+                case 2:
+                    current_marker = marker_choices[inx]
+        style = (current_color, current_marker, current_linestyle)
+        key = tuple([value[inv] for inv in inv_col])
+        styles[key] = style
+    return styles
+
+
+def format_col(col, value):
+    if "size" in col:
+        return format_bytes(value)
+    else:
+        return str(value)
 
 
 def plot_on_axis(
@@ -179,17 +266,20 @@ def plot_on_axis(
     y_col: Col,
     lines: list[Col] = [Col("compression", "comp", "")],
     callbacks: list[Callable[[plt.Axes, PlotData], None]] = [],
+    filter_cols: list[tuple[Col, Any]] = [],
     filters: list[DataFilter] = [],
     axis_style: AxesScale = "semilogx",
     aggrigate: bool = False,
 ):
     cols = [pl.col(l.col) for l in lines]
-    rows = data.select(*cols).unique().sort(by=cols)
+    if len(filter_cols) > 0:
+        filtered_data = data.filter(*[pl.col(c.col) == v for c, v in filter_cols])
+    else:
+        filtered_data = data
 
-    markers = "o^sp*dP"
-    colors_and_markers = [
-        (c, m) for m, c in itertools.product(markers, mcolors.TABLEAU_COLORS)
-    ]
+    rows = filtered_data.select(*cols).unique().sort(by=cols)
+
+    styles = get_colors_for_columns(filtered_data, cols, sort=False)
 
     x_min = None
     x_max = None
@@ -200,8 +290,8 @@ def plot_on_axis(
             x_max = filter.x_max if x_max is None else max(x_max, filter.x_max)
 
     for ii, row in enumerate(rows.iter_rows(named=True)):
-        # current_color = colors[ii]
-        current_color, current_marker = colors_and_markers[ii]
+        key = tuple([row[l.col] for l in lines])
+        current_color, current_marker, current_linestyle = styles[key]
 
         run_loop = True
         for filter in filters:
@@ -211,7 +301,7 @@ def plot_on_axis(
             continue
 
         dt = (
-            data.filter(*[pl.col(l.col) == row[l.col] for l in lines])
+            filtered_data.filter(*[pl.col(l.col) == row[l.col] for l in lines])
             .group_by(
                 pl.col(x_col.col),
             )
@@ -232,16 +322,15 @@ def plot_on_axis(
             y_data_max=dt["max"].to_numpy(),
         )
         plot_data = plot_data.filter(x_min, x_max)
-        row_strs = [f"{l.prefix}: {row[l.col]}" for l in lines]
+        row_strs = [f"{l.prefix}: {format_col(l.col, row[l.col])}" for l in lines]
         str_s = f"{y_col.prefix}: {' '.join(row_strs)}"
-        linestyle = "--"
         if aggrigate:
             plot_data.plot_agg(
-                ax, axis_style, str_s, current_color, current_marker, linestyle
+                ax, axis_style, str_s, current_color, current_marker, current_linestyle
             )
         else:
             plot_data.plot(
-                ax, axis_style, str_s, current_color, current_marker, linestyle
+                ax, axis_style, str_s, current_color, current_marker, current_linestyle
             )
 
         for callback in callbacks:
@@ -257,8 +346,10 @@ def plot_single(
     y_col: Col,
     lines: list[Col] = [Col("compression", "comp", "")],
     callbacks: list[Callable[[plt.Axes, PlotData], None]] = [],
+    filter_cols: list[tuple[Col, Any]] = [],
     filters: list[DataFilter] = [],
     subplots_adjust: None | dict[str, Any] = None,
+    title: None | str = None,
     filename: None | Path = None,
     axis_style: AxesScale = "semilogx",
     aggrigate: bool = False,
@@ -267,6 +358,9 @@ def plot_single(
     if subplots_adjust:
         fig.subplots_adjust(**subplots_adjust)
 
+    if title is not None:
+        fig.suptitle(title)
+
     plot_on_axis(
         ax=ax,
         data=data,
@@ -274,6 +368,7 @@ def plot_single(
         y_col=y_col,
         lines=lines,
         callbacks=callbacks,
+        filter_cols=filter_cols,
         filters=filters,
         axis_style=axis_style,
         aggrigate=aggrigate,
@@ -293,16 +388,23 @@ def plot_vertical(
     y_col: Col,
     lines: list[Col] = [Col("compression", "comp", "")],
     callbacks: list[Callable[[plt.Axes, PlotData], None]] = [],
+    filter_cols: list[tuple[Col, Any]] = [],
     filters: list[DataFilter] = [],
     subplots_adjust: None | dict[str, Any] = None,
+    title: None | str = None,
     filename: None | Path = None,
     axis_style: AxesScale = "semilogx",
     aggrigate: bool = False,
 ):
     nrows = len(filters)
-    fig, axs = plt.subplots(nrows=nrows, figsize=(16, nrows * 8))
+    fig, axs = plt.subplots(nrows=nrows, figsize=(16, nrows * 8), sharex=True)
+    if nrows == 1:
+        axs = [axs]
     if subplots_adjust:
         fig.subplots_adjust(**subplots_adjust)
+
+    if title is not None:
+        fig.suptitle(title)
 
     for ii, filter in enumerate(filters):
         plot_on_axis(
@@ -312,6 +414,7 @@ def plot_vertical(
             y_col,
             lines,
             callbacks,
+            filter_cols,
             [filter],
             axis_style,
             aggrigate,
@@ -347,6 +450,7 @@ def plot_size_vs_chunk_size(data, base_dir):
         Col("chunk_size", "", "chunk size (bytes)"),
         Col("size", "", "file size"),
         lines=[
+            Col("data_size", "dt", ""),
             Col("compression", "comp", ""),
             Col("filetype", "ft", ""),
         ],
@@ -359,6 +463,7 @@ def plot_size_vs_chunk_size(data, base_dir):
         Col("chunk_size", "", "chunk size (bytes)"),
         Col("size", "", "file size"),
         lines=[
+            Col("data_size", "dt", ""),
             Col("compression", "comp", ""),
             Col("filetype", "ft", ""),
         ],
@@ -372,6 +477,7 @@ def plot_size_vs_chunk_size(data, base_dir):
         Col("chunk_size", "", "chunk size (bytes)"),
         Col("size", "", "file size"),
         lines=[
+            Col("data_size", "dt", ""),
             Col("compression", "comp", ""),
             Col("filetype", "ft", ""),
         ],
@@ -388,10 +494,12 @@ def plot_time_vs_chunk_size(data, base_dir):
         Col("chunk_size", "", "chunk size (bytes)"),
         Col("time", "", "write time (seconds)"),
         lines=[
+            Col("data_size", "dt", ""),
             Col("compression", "comp", ""),
             Col("filetype", "ft", ""),
         ],
         callbacks=[plot_x_sizes],
+        title="write time vs chunk size",
         filename=base_dir / "time full.png",
         aggrigate=True,
     )
@@ -400,6 +508,7 @@ def plot_time_vs_chunk_size(data, base_dir):
         Col("chunk_size", "", "chunk size (bytes)"),
         Col("time", "", "write time (seconds)"),
         lines=[
+            Col("data_size", "dt", ""),
             Col("compression", "comp", ""),
             Col("filetype", "ft", ""),
         ],
@@ -408,6 +517,7 @@ def plot_time_vs_chunk_size(data, base_dir):
             DataFilter(run=accept_compressed),
             DataFilter(x_min=16 * 1024, run=accept_compressed),
         ],
+        title="write time vs chunk size with varius compressions",
         filename=base_dir / "time compressed.png",
         aggrigate=True,
     )
@@ -416,6 +526,7 @@ def plot_time_vs_chunk_size(data, base_dir):
         Col("chunk_size", "", "chunk size (bytes)"),
         Col("time", "", "write time (seconds)"),
         lines=[
+            Col("data_size", "dt", ""),
             Col("compression", "comp", ""),
             Col("filetype", "ft", ""),
         ],
@@ -424,7 +535,71 @@ def plot_time_vs_chunk_size(data, base_dir):
             DataFilter(run=accept_blosc),
             DataFilter(x_min=16 * 1024, run=accept_blosc),
         ],
+        title="write time vs chunk size with blosc",
         filename=base_dir / "time blosc.png",
+        aggrigate=True,
+    )
+
+
+def plot_size_and_time(
+    data,
+    base_dir: Path,
+    filetype: None | str,
+    compression: None | str,
+    data_size: None | int,
+    run_filter: FilterFunc = accept_all,
+):
+    lines: list[Col] = []
+    if filetype is None:
+        lines.append(Col("filetype", "dt", ""))
+    if compression is None:
+        lines.append(Col("compression", "dt", ""))
+    lines.append(Col("memory_count", "mc", ""))
+    if data_size is None:
+        lines.append(Col("data_size", "dt", ""))
+
+    filter_cols: list[tuple[Col, Any]] = []
+    if compression is not None:
+        filter_cols.append((Col("compression", "", ""), compression))
+    if filetype is not None:
+        filter_cols.append((Col("filetype", "", ""), filetype))
+    if data_size is not None:
+        filter_cols.append((Col("data_size", "", ""), data_size))
+    filters = [
+        DataFilter(run=run_filter),
+        DataFilter(x_min=255 * 1024, run=run_filter),
+        DataFilter(x_min=255 * 1024, run=lambda x: accept_int_mc(x) and run_filter(x)),
+        DataFilter(
+            x_min=255 * 1024,
+            run=lambda x: x["memory_count"] >= 2 and run_filter(x),
+        ),
+    ]
+
+    data_size_str = "all" if data_size is None else format_bytes(data_size)
+
+    plot_vertical(
+        data,
+        Col("chunk_size", "", "chunk size (bytes)"),
+        Col("time", "", "write time (seconds)"),
+        lines=lines,
+        callbacks=[plot_x_sizes],
+        filter_cols=filter_cols,
+        filters=filters,
+        title=f"write time vs chunk size for {filetype} with {compression} on {data_size_str}",
+        filename=base_dir / f"time {filetype} {compression} {data_size_str}.png",
+        aggrigate=True,
+    )
+
+    plot_vertical(
+        data,
+        Col("chunk_size", "", "chunk size (bytes)"),
+        Col("size", "", "file size"),
+        lines=lines,
+        callbacks=[plot_x_sizes, yaxis_format_bytes],
+        filter_cols=filter_cols,
+        filters=filters,
+        title=f"file size vs chunk size for {filetype} with {compression} on {data_size_str}",
+        filename=base_dir / f"size {filetype} {compression} {data_size_str}.png",
         aggrigate=True,
     )
 
@@ -434,120 +609,24 @@ def plot(data, base_dir):
     plot_size_vs_chunk_size(data, base_dir)
     plot_time_vs_chunk_size(data, base_dir)
 
-    plot_vertical(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("time", "", "write time (seconds)"),
-        lines=[
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-            Col("memory_count", "mc", ""),
-        ],
-        callbacks=[plot_x_sizes],
-        filters=[
-            DataFilter(run=lambda x: accept_blosc(x) and accept_zarr(x)),
-            DataFilter(
-                x_min=16 * 1024, run=lambda x: accept_blosc(x) and accept_zarr(x)
-            ),
-            DataFilter(
-                x_min=16 * 1024,
-                run=lambda x: (
-                    accept_blosc(x) and accept_zarr(x) and x["memory_count"] >= 1.0
-                ),
-            ),
-        ],
-        filename=base_dir / "time zarr blosc.png",
-        aggrigate=True,
-    )
+    for filetype in [None, "deflate_zarr", "store_zarr", "hdf"]:
+        for compression in [None, "blosc", "gzip-4"]:
+            for data_size in [None, 64 * 1024 * 1024, 512 * 1024 * 1024]:
+                if filetype is None:
+                    run_filter = lambda x: x["filetype"] in ["store_zarr", "hdf"]
+                else:
+                    run_filter = accept_all
 
-    plot_vertical(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("time", "", "write time (seconds)"),
-        lines=[
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-            Col("memory_count", "mc", ""),
-        ],
-        callbacks=[plot_x_sizes],
-        filters=[
-            DataFilter(run=lambda x: accept_blosc(x) and (not accept_zarr(x))),
-            DataFilter(
-                x_min=16 * 1024, run=lambda x: accept_blosc(x) and (not accept_zarr(x))
-            ),
-            DataFilter(
-                x_min=16 * 1024,
-                run=lambda x: (
-                    accept_blosc(x)
-                    and (not accept_zarr(x))
-                    and x["memory_count"] >= 1.0
-                ),
-            ),
-        ],
-        filename=base_dir / "time hdf blosc.png",
-        aggrigate=True,
-    )
-
-    plot_vertical(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("size", "", "file size"),
-        lines=[
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-            Col("memory_count", "mc", ""),
-        ],
-        callbacks=[plot_x_sizes, yaxis_format_bytes],
-        filters=[
-            DataFilter(run=lambda x: accept_blosc(x) and accept_zarr(x)),
-            DataFilter(
-                x_min=16 * 1024, run=lambda x: accept_blosc(x) and accept_zarr(x)
-            ),
-            DataFilter(
-                x_min=16 * 1024,
-                run=lambda x: (
-                    accept_blosc(x) and accept_zarr(x) and x["memory_count"] >= 1.0
-                ),
-            ),
-        ],
-        filename=base_dir / "size zarr blosc.png",
-        aggrigate=True,
-    )
-
-    plot_vertical(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("size", "", "file size"),
-        lines=[
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-            Col("memory_count", "mc", ""),
-        ],
-        callbacks=[plot_x_sizes, yaxis_format_bytes],
-        filters=[
-            DataFilter(run=lambda x: accept_blosc(x) and (not accept_zarr(x))),
-            DataFilter(
-                x_min=16 * 1024, run=lambda x: accept_blosc(x) and (not accept_zarr(x))
-            ),
-            DataFilter(
-                x_min=16 * 1024,
-                run=lambda x: (
-                    accept_blosc(x)
-                    and (not accept_zarr(x))
-                    and x["memory_count"] >= 1.0
-                ),
-            ),
-        ],
-        filename=base_dir / "size hdf blosc.png",
-        aggrigate=True,
-    )
+                plot_size_and_time(
+                    data, base_dir, filetype, compression, data_size, run_filter
+                )
 
     # plt.show()
 
 
 def read() -> None:
 
-    in_path = Path("C:/Workspace/data/out/little-benchmark/output_zarr.log")
+    in_path = Path("C:/Workspace/data/out/little-benchmark/output_sizes.log")
     base_dir = Path(in_path.parent / "plots")
     base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -561,27 +640,35 @@ def read() -> None:
                 if line.startswith("Wrote:"):
                     if len(current_data) != 0:
                         hdf = (current_data["hdf_time"], current_data["hdf_size"])
-                        zarr = (current_data["zarr_time"], current_data["zarr_size"])
+                        szarr = (current_data["szarr_time"], current_data["szarr_size"])
+                        dzarr = (current_data["dzarr_time"], current_data["dzarr_size"])
 
                         new_data = copy.copy(current_data)
                         del new_data["hdf_time"]
                         del new_data["hdf_size"]
-                        del new_data["zarr_time"]
-                        del new_data["zarr_size"]
+                        del new_data["szarr_time"]
+                        del new_data["szarr_size"]
+                        del new_data["dzarr_time"]
+                        del new_data["dzarr_size"]
 
                         hdf_data = new_data | dict(
                             time=hdf[0], size=hdf[1], filetype="hdf"
                         )
-                        zarr_data = new_data | dict(
-                            time=zarr[0], size=zarr[1], filetype="zarr"
+                        szarr_data = new_data | dict(
+                            time=szarr[0], size=szarr[1], filetype="store_zarr"
+                        )
+                        dzarr_data = new_data | dict(
+                            time=dzarr[0], size=dzarr[1], filetype="deflate_zarr"
                         )
                         results.append(FileResult(**hdf_data))
-                        results.append(FileResult(**zarr_data))
+                        results.append(FileResult(**szarr_data))
+                        results.append(FileResult(**dzarr_data))
                     else:
                         assert len(current_data) == 0
 
-                    current_data = dict(filename=" ".join(parts[1:]))
-                    compression = current_data["filename"].split(maxsplit=1)[0]
+                    current_data = {}
+                    filename = " ".join(parts[1:])
+                    compression = filename.split(maxsplit=1)[0]
                     current_data["compression"] = compression
                 elif "shape" in name:
                     end = " ".join(parts[1:])
@@ -623,5 +710,22 @@ def read() -> None:
 
     data = pl.DataFrame([asdict(r) for r in filtered_results])
     ic(data["time"].sum())
+
+    for col in data.get_columns():
+        vals = col.unique()
+        print(f"{col.name}: {vals.shape}")
+
+    # res = ic(
+    #     data.filter(
+    #         pl.col("memory_count") == 1.0,
+    #         pl.col("compression") == "gzip-4",
+    #         pl.col("chunk_size") == 1024 * 1024 * 64,
+    #         pl.col("filetype") == "hdf",
+    #     )
+    # )
+    #
+    # for col in res.get_columns():
+    #     vals = col.unique()
+    #     print(f"{col.name}: {vals.shape}")
 
     plot(data, base_dir)
