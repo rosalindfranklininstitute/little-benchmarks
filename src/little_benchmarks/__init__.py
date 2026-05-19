@@ -4,7 +4,7 @@
 
 from ms_nexus_tools.lib.utils import format_bytes
 import time
-from typing import Any
+from typing import Any, Literal
 import itertools
 from pathlib import Path
 import concurrent.futures as cfutures
@@ -51,12 +51,33 @@ def comp_str(compression: Any, compression_opts: Any) -> str:
             )
 
 
+def write_chunks(
+    store: Any, data, memory_chunks: list[Chunk], thread_count: int, title: str
+):
+
+    def write_chunk(chunk):
+        store[*chunk] = data[*chunk]
+
+    with cfutures.ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = [
+            executor.submit(write_chunk, memory_chunk) for memory_chunk in memory_chunks
+        ]
+
+        for memory_chunk in tqdm(
+            cfutures.as_completed(futures),
+            total=len(memory_chunks),
+            desc=title,
+        ):
+            pass
+
+
 def write_hdf5(
     filename: Path,
     memory: Chunker,
     chunker: Chunker,
     compression: Any,
     compression_opts: Any,
+    thread_count: int,
     data,
 ) -> float:
 
@@ -88,8 +109,7 @@ def write_hdf5(
             compression_opts=compression_opts,
             chunks=chunker.chunk_shape,
         )
-        for ii, c in enumerate(tqdm(memory_chunks, desc="Writing hdf")):
-            ds[*c] = data[*c]
+        write_chunks(ds, data, memory_chunks, thread_count, f"Writing hdf")
         h5.close()
 
     stop = time.monotonic()
@@ -102,6 +122,7 @@ def write_zarr(
     chunker: Chunker,
     compression: Any,
     compression_opts: Any,
+    thread_count: int,
     data,
     zip_compression=ZIP_STORED,
 ) -> float:
@@ -139,28 +160,68 @@ def write_zarr(
                 dtype=np.int32,
                 compressors=compressor,
             )
-            for ii, c in enumerate(
-                tqdm(memory_chunks, desc=f"Writing zarr {zip_compression}")
-            ):
-                z[*c] = data[*c]
+
+            write_chunks(
+                z, data, memory_chunks, thread_count, f"Writing zarr {zip_compression}"
+            )
+
             store.close()
 
         stop = time.monotonic()
     return stop - start
 
 
+def calculate_memory_chunker(
+    chunker: Chunker,
+    memory_count: float,
+    chunk_multiple: Literal["all", "last", "first"],
+) -> tuple[Chunker | None, bool]:
+
+    proposed_chunk = []
+    match chunk_multiple:
+        case "all":
+            proposed_chunk = [int(round(c * memory_count)) for c in chunker.chunk_shape]
+        case "first":
+            proposed_chunk = [c for c in chunker.chunk_shape]
+            proposed_chunk[0] = int(
+                round(proposed_chunk[0] * memory_count ** len(chunker.chunk_shape))
+            )
+        case "last":
+            proposed_chunk = [c for c in chunker.chunk_shape]
+            proposed_chunk[-1] = int(
+                round(proposed_chunk[-1] * memory_count ** len(chunker.chunk_shape))
+            )
+        case _:
+            raise NotImplementedError(
+                f"Chunk chape multiple '{chunk_multiple}' unknown."
+            )
+
+    if np.any([c > d for c, d in zip(proposed_chunk, chunker.data_shape)]):
+        None, False
+
+    memory = Chunker.from_chunk_shape(
+        data_shape=chunker.data_shape,
+        chunk_shape=tuple(proposed_chunk),
+    )
+    return memory, True
+
+
 def write_data(data, log_file: Path, out_path: Path):
     # compressions: dict[Any, list[Any]] = dict(gzip=[4, 9], none=[None])
     compressions: dict[Any, list[Any]] = dict(gzip=[4], none=[None], blosc=[None])
 
-    chunk_sizes = [(2**i) for i in range(14, 26, 1)]
-    memory_counts = [1, 1.5, 2, 3]
+    # chunk_sizes = [(2**i) for i in range(14, 28, 1)]
+    chunk_sizes = [(2**i) for i in range(16, 26, 1)]
+    # memory_counts = [1, 1.5, 2, 3]
+    memory_counts = [1, 1.5, 3]
     memory_counts_dict = {count: ii for ii, count in enumerate(memory_counts)}
     max_memory_buffer = np.prod(data.shape)
 
     memory_combos = [
-        (chunk_size, memory_count)
-        for chunk_size, memory_count in itertools.product(chunk_sizes, memory_counts)
+        (chunk_size, memory_count, chunk_multiple)
+        for chunk_size, memory_count, chunk_multiple in itertools.product(
+            chunk_sizes, memory_counts, ["all", "last", "first"]
+        )
     ]
 
     compression_combos = []
@@ -168,92 +229,102 @@ def write_data(data, log_file: Path, out_path: Path):
         for compression_opts in opts:
             compression_combos.append((compression, compression_opts))
 
-    total_count = len(compression_combos) * len(memory_combos)
+    # thread_combos = [1, 2, 4, 8]
+    thread_combos = [1]
+
+    total_count = len(compression_combos) * len(memory_combos) * len(thread_combos)
     current_count = 0
 
     global fle
     with open(log_file, "a") as fle:
         for compression, compression_opts in compression_combos:
-            for chunk_size, memory_count in memory_combos:
+            for chunk_size, memory_count, chunk_multiple in memory_combos:
                 chunker = Chunker.from_max_item_count(
                     data_shape=data.shape,
                     priorities=(1, 1, 1),
                     items_per_chunk=chunk_size,
                 )
-                if np.any(
-                    [
-                        c * memory_count > d
-                        for c, d in zip(chunker.chunk_shape, chunker.data_shape)
-                    ]
-                ):
-                    continue
-
-                memory = Chunker.from_chunk_shape(
-                    data_shape=data.shape,
-                    chunk_shape=tuple(
-                        [int(round(c * memory_count)) for c in chunker.chunk_shape]
-                    ),
+                memory, valid_size = calculate_memory_chunker(
+                    chunker, memory_count, chunk_multiple
                 )
+                if not valid_size:
+                    continue
+                assert memory is not None
+
                 memory_chunks = [c for c in memory.chunks()]
 
-                filename = f"{comp_str(compression, compression_opts)} m-{np.prod(memory.chunk_shape)} c-{np.prod(chunker.chunk_shape)}"
-                hdf_file: Path = out_path / f"{filename}.hdf5"
-                szarr_file: Path = out_path / f"{filename}.szarr"
-                dzarr_file: Path = out_path / f"{filename}.dzarr"
+                for thread_count in thread_combos:
+                    filename = f"{comp_str(compression, compression_opts)} m-{np.prod(memory.chunk_shape)} c-{np.prod(chunker.chunk_shape)} t={thread_count}"
+                    hdf_file: Path = out_path / f"{filename}.hdf5"
+                    szarr_file: Path = out_path / f"{filename}.szarr"
+                    # dzarr_file: Path = out_path / f"{filename}.dzarr"
 
-                hdf_time = write_hdf5(
-                    hdf_file,
-                    memory,
-                    chunker,
-                    compression,
-                    compression_opts,
-                    data,
-                )
-                time.sleep(1)
-                szarr_time = write_zarr(
-                    szarr_file,
-                    memory,
-                    chunker,
-                    compression,
-                    compression_opts,
-                    data,
-                    zip_compression=ZIP_STORED,
-                )
-                time.sleep(1)
-                dzarr_time = write_zarr(
-                    dzarr_file,
-                    memory,
-                    chunker,
-                    compression,
-                    compression_opts,
-                    data,
-                    zip_compression=ZIP_DEFLATED,
-                )
-                for _ in trange(5, desc="pause"):
+                    hdf_time = write_hdf5(
+                        hdf_file,
+                        memory,
+                        chunker,
+                        compression,
+                        compression_opts,
+                        thread_count,
+                        data,
+                    )
                     time.sleep(1)
+                    szarr_time = write_zarr(
+                        szarr_file,
+                        memory,
+                        chunker,
+                        compression,
+                        compression_opts,
+                        thread_count,
+                        data,
+                        zip_compression=ZIP_STORED,
+                    )
+                    # time.sleep(1)
+                    # dzarr_time = write_zarr(
+                    #     dzarr_file,
+                    #     memory,
+                    #     chunker,
+                    #     compression,
+                    #     compression_opts,
+                    #     thread_count,
+                    #     data,
+                    #     zip_compression=ZIP_DEFLATED,
+                    # )
+                    for _ in trange(5, desc="pause"):
+                        time.sleep(1)
 
-                print(
-                    f" --- {current_count}/{total_count} = {float(current_count) / total_count * 100:.1f}% ---"
-                )
-                write(f"Wrote: {filename}")
-                write(f" hdf_time: {hdf_time:.1f} seconds.")
-                write(f" hdf_size: {format_bytes(hdf_file.stat().st_size)}")
-                write(f" szarr_time: {szarr_time:.1f} seconds.")
-                write(f" szarr_size: {format_bytes(szarr_file.stat().st_size)}")
-                write(f" dzarr_time: {dzarr_time:.1f} seconds.")
-                write(f" dzarr_size: {format_bytes(dzarr_file.stat().st_size)}")
-                write(f" data_size: {format_bytes(np.prod(data.shape) * 4)}")
-                write(f" chunk_shape: {chunker.chunk_shape}")
-                write(f" chunk_size: {format_bytes(np.prod(chunker.chunk_shape) * 4)}")
-                write(f" memory_count: {memory_count}")
-                write(f" memory_shape: {memory.chunk_shape}")
-                write(f" memory_size: {format_bytes(np.prod(memory.chunk_shape) * 4)}")
-                fle.flush()
+                    print(
+                        f" --- {current_count}/{total_count} = {float(current_count) / total_count * 100:.1f}% ---"
+                    )
+                    write(f"Wrote: {filename}")
+                    write(f" hdf_time: {hdf_time:.1f} seconds.")
+                    write(f" hdf_size: {format_bytes(hdf_file.stat().st_size)}")
+                    write(f" szarr_time: {szarr_time:.1f} seconds.")
+                    write(f" szarr_size: {format_bytes(szarr_file.stat().st_size)}")
+                    # write(f" dzarr_time: {dzarr_time:.1f} seconds.")
+                    # write(f" dzarr_size: {format_bytes(dzarr_file.stat().st_size)}")
+                    write(f" thread_count: {thread_count}")
+                    write(f" memory_count: {memory_count}")
+                    write(f" memory_multiple: {chunk_multiple}")
 
-                hdf_file.unlink()
-                szarr_file.unlink()
-                dzarr_file.unlink()
-                current_count += 1
+                    write(f" data_shape: {data.shape}")
+                    write(f" data_size: {format_bytes(np.prod(data.shape) * 4)}")
+
+                    write(f" chunk_shape: {chunker.chunk_shape}")
+                    write(
+                        f" chunk_size: {format_bytes(np.prod(chunker.chunk_shape) * 4)}"
+                    )
+
+                    write(f" memory_shape: {memory.chunk_shape}")
+                    write(
+                        f" memory_size: {format_bytes(np.prod(memory.chunk_shape) * 4)}"
+                    )
+                    fle.flush()
+
+                    hdf_file.unlink()
+                    szarr_file.unlink()
+                    # dzarr_file.unlink()
+                    current_count += 1
 
 
 def main() -> None:
@@ -266,15 +337,11 @@ def main() -> None:
 
     rng = np.random.default_rng(seed=1298)
 
-    small_width = 256
-    small_data = rng.random((small_width, small_width, small_width)) * 1000
+    # for width in [384, 512, 768]:
+    for width in [384]:
+        data = rng.random((width, width, width)) * 1000
 
-    write_data(small_data, log_file, out_path)
-
-    med_width = 512
-    med_data = rng.random((med_width, med_width, med_width)) * 1000
-
-    write_data(med_data, log_file, out_path)
+        write_data(data, log_file, out_path)
 
 
 def read():

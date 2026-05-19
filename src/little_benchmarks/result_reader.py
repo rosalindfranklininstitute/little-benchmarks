@@ -25,12 +25,15 @@ class FileResult:
     filetype: str
     time: float
     size: int
+    thread_count: float
+    data_shape: Shape
     data_size: int
     chunk_shape: Shape
     chunk_size: int
     memory_count: float
     memory_shape: Shape
     memory_size: int
+    memory_multiple: str
 
 
 class Col(NamedTuple):
@@ -444,103 +447,6 @@ def xaxis_format_float(ax: plt.Axes, plot_data: PlotData):
     ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos=None: f"{x}"))
 
 
-def plot_size_vs_chunk_size(data, base_dir):
-    plot_single(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("size", "", "file size"),
-        lines=[
-            Col("data_size", "dt", ""),
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-        ],
-        callbacks=[yaxis_format_bytes, plot_x_sizes],
-        filename=base_dir / "size full.png",
-        aggrigate=True,
-    )
-    plot_single(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("size", "", "file size"),
-        lines=[
-            Col("data_size", "dt", ""),
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-        ],
-        callbacks=[yaxis_format_bytes, plot_x_sizes],
-        filters=[DataFilter(run=accept_compressed)],
-        filename=base_dir / "size compressed.png",
-        aggrigate=True,
-    )
-    plot_single(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("size", "", "file size"),
-        lines=[
-            Col("data_size", "dt", ""),
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-        ],
-        callbacks=[yaxis_format_bytes, plot_x_sizes],
-        filters=[DataFilter(run=accept_blosc)],
-        filename=base_dir / "size blosc.png",
-        aggrigate=True,
-    )
-
-
-def plot_time_vs_chunk_size(data, base_dir):
-    plot_single(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("time", "", "write time (seconds)"),
-        lines=[
-            Col("data_size", "dt", ""),
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-        ],
-        callbacks=[plot_x_sizes],
-        title="write time vs chunk size",
-        filename=base_dir / "time full.png",
-        aggrigate=True,
-    )
-    plot_vertical(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("time", "", "write time (seconds)"),
-        lines=[
-            Col("data_size", "dt", ""),
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-        ],
-        callbacks=[plot_x_sizes],
-        filters=[
-            DataFilter(run=accept_compressed),
-            DataFilter(x_min=16 * 1024, run=accept_compressed),
-        ],
-        title="write time vs chunk size with varius compressions",
-        filename=base_dir / "time compressed.png",
-        aggrigate=True,
-    )
-    plot_vertical(
-        data,
-        Col("chunk_size", "", "chunk size (bytes)"),
-        Col("time", "", "write time (seconds)"),
-        lines=[
-            Col("data_size", "dt", ""),
-            Col("compression", "comp", ""),
-            Col("filetype", "ft", ""),
-        ],
-        callbacks=[plot_x_sizes],
-        filters=[
-            DataFilter(run=accept_blosc),
-            DataFilter(x_min=16 * 1024, run=accept_blosc),
-        ],
-        title="write time vs chunk size with blosc",
-        filename=base_dir / "time blosc.png",
-        aggrigate=True,
-    )
-
-
 def plot_size_and_time(
     data,
     base_dir: Path,
@@ -555,6 +461,8 @@ def plot_size_and_time(
     if compression is None:
         lines.append(Col("compression", "dt", ""))
     lines.append(Col("memory_count", "mc", ""))
+    lines.append(Col("memory_multiple", "mm", ""))
+    lines.append(Col("thread_count", "tc", ""))
     if data_size is None:
         lines.append(Col("data_size", "dt", ""))
 
@@ -606,12 +514,19 @@ def plot_size_and_time(
 
 def plot(data, base_dir):
 
-    plot_size_vs_chunk_size(data, base_dir)
-    plot_time_vs_chunk_size(data, base_dir)
+    sizes = [
+        s[0]
+        for s in data.select(pl.col("data_size"))
+        .unique()
+        .sort(by=pl.col("data_size"))
+        .rows()
+    ]
+    ic(sizes)
 
-    for filetype in [None, "deflate_zarr", "store_zarr", "hdf"]:
+    for filetype in [None, "store_zarr", "hdf"]:
+        # for filetype in [None, "deflate_zarr", "store_zarr", "hdf"]:
         for compression in [None, "blosc", "gzip-4"]:
-            for data_size in [None, 64 * 1024 * 1024, 512 * 1024 * 1024]:
+            for data_size in [None, *sizes]:
                 if filetype is None:
                     run_filter = lambda x: x["filetype"] in ["store_zarr", "hdf"]
                 else:
@@ -626,7 +541,7 @@ def plot(data, base_dir):
 
 def read() -> None:
 
-    in_path = Path("C:/Workspace/data/out/little-benchmark/output_sizes.log")
+    in_path = Path("C:/Workspace/data/out/little-benchmark/output_shapes.log")
     base_dir = Path(in_path.parent / "plots")
     base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -641,15 +556,15 @@ def read() -> None:
                     if len(current_data) != 0:
                         hdf = (current_data["hdf_time"], current_data["hdf_size"])
                         szarr = (current_data["szarr_time"], current_data["szarr_size"])
-                        dzarr = (current_data["dzarr_time"], current_data["dzarr_size"])
+                        # dzarr = (current_data["dzarr_time"], current_data["dzarr_size"])
 
                         new_data = copy.copy(current_data)
                         del new_data["hdf_time"]
                         del new_data["hdf_size"]
                         del new_data["szarr_time"]
                         del new_data["szarr_size"]
-                        del new_data["dzarr_time"]
-                        del new_data["dzarr_size"]
+                        # del new_data["dzarr_time"]
+                        # del new_data["dzarr_size"]
 
                         hdf_data = new_data | dict(
                             time=hdf[0], size=hdf[1], filetype="hdf"
@@ -657,12 +572,12 @@ def read() -> None:
                         szarr_data = new_data | dict(
                             time=szarr[0], size=szarr[1], filetype="store_zarr"
                         )
-                        dzarr_data = new_data | dict(
-                            time=dzarr[0], size=dzarr[1], filetype="deflate_zarr"
-                        )
+                        # dzarr_data = new_data | dict(
+                        #     time=dzarr[0], size=dzarr[1], filetype="deflate_zarr"
+                        # )
                         results.append(FileResult(**hdf_data))
                         results.append(FileResult(**szarr_data))
-                        results.append(FileResult(**dzarr_data))
+                        # results.append(FileResult(**dzarr_data))
                     else:
                         assert len(current_data) == 0
 
@@ -680,8 +595,10 @@ def read() -> None:
                     current_data[name] = size
                 elif "time" in name:
                     current_data[name] = float(parts[1])
-                elif name == "memory_count":
+                elif "count" in name:
                     current_data[name] = float(parts[1])
+                elif "memory_multiple" == name:
+                    current_data[name] = parts[1]
                 else:
                     raise ValueError(
                         f"Unknown result part: {parts[0]} on line {line_no}"
